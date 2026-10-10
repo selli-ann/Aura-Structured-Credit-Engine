@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.27;
+
+contract AuraStructuredCreditEngine {
+    struct TrancheProvider {
+        uint256 suppliedETH;
+        uint256 yieldCredit;
+        bool isActive;
+    }
+
+    struct BorrowerFacility {
+        uint256 collateralETH;
+        uint256 borrowedPrincipal;
+        uint256 maxCreditLimit;
+        bool isOpen;
+    }
+
+    address payable public immutable creditGovernor;
+    string public protocolDescriptor;
+    uint256 public borrowInterestBps; // 350 = 3.5%
+    uint256 public totalSeniorCapital;
+    uint256 public totalJuniorCapital;
+    uint256 public totalBorrowedDebt;
+    uint256 public accumulatedInterestPool;
+    bool public isProtocolPaused;
+
+    mapping(bytes32 => bool) public approvedCollaterals;
+    mapping(address => TrancheProvider) public seniorProviders;
+    mapping(address => TrancheProvider) public juniorProviders;
+    mapping(address => BorrowerFacility) public facilities;
+
+    event CollateralTypeWhitelisted(bytes32 indexed collateralKey);
+    event BorrowRateAdjusted(uint256 newRateBps);
+    event CreditBorrowed(address indexed borrower, uint256 amount);
+    event FacilityClosed(address indexed borrower, uint256 returnedCollateral);
+    event JuniorCapitalSupplied(address indexed provider, uint256 amount);
+    event SeniorCapitalSupplied(address indexed provider, uint256 amount);
+    event ReservesDrained(address indexed governor, uint256 amount);
+    event InterestHarvested(address indexed governor, uint256 amount);
+    event FacilityLiquidated(address indexed borrower, address indexed liquidator, uint256 seizedCollateral);
+    event CollateralLocked(address indexed borrower, uint256 amount, uint256 creditLimit);
+    event FacilityLimitRebalanced(address indexed borrower, uint256 newLimit);
+    event CreditRepaid(address indexed borrower, uint256 amount);
+    event PauseStateToggled(bool isPaused);
+    event LenderStakeTransferred(address indexed from, address indexed to, uint256 amount);
+    event DescriptorUpdated(string newDescriptor);
+    event SeniorCapitalWithdrawn(address indexed provider, uint256 amount);
+
+    modifier onlyGovernor() {
+        require(msg.sender == creditGovernor, "AuraCredit: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isProtocolPaused, "AuraCredit: Protocol paused");
+        _;
+    }
+
+    constructor() {
+        creditGovernor = payable(msg.sender);
+        protocolDescriptor = "Aura Base Structured Credit Tranche Engine v1";
+        borrowInterestBps = 350; // 3.5%
+        isProtocolPaused = false;
+        approvedCollaterals[0x424153455f4352454449545f434f4c4c41544552414c00000000000000000000] = true;
+    }
+
+    // 1. addSupportedCollateralType
+    function addSupportedCollateralType(bytes32 collateralKey) external onlyGovernor {
+        require(!approvedCollaterals[collateralKey], "AuraCredit: Already supported");
+        approvedCollaterals[collateralKey] = true;
+        emit CollateralTypeWhitelisted(collateralKey);
+    }
+
+    // 2. adjustBorrowInterestRate
+    function adjustBorrowInterestRate(uint256 newRateBps) external onlyGovernor {
+        require(newRateBps <= 2000, "AuraCredit: Rate cap 20%");
+        borrowInterestBps = newRateBps;
+        emit BorrowRateAdjusted(newRateBps);
+    }
+
+    // 3. borrowFromCreditLine
+    function borrowFromCreditLine(uint256 amount) external whenNotPaused {
+        BorrowerFacility storage b = facilities[msg.sender];
+        require(b.isOpen, "AuraCredit: Facility closed");
+        require(b.borrowedPrincipal + amount <= b.maxCreditLimit, "AuraCredit: Limit exceeded");
+        require(address(this).balance >= amount, "AuraCredit: Insufficient cash");
+
+        b.borrowedPrincipal += amount;
+        totalBorrowedDebt += amount;
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "AuraCredit: Payout failed");
+
+        emit CreditBorrowed(msg.sender, amount);
+    }
+
+    // 4. closeCreditFacility
+    function closeCreditFacility() external {
+        BorrowerFacility storage b = facilities[msg.sender];
+        require(b.isOpen, "AuraCredit: Not open");
+        require(b.borrowedPrincipal == 0, "AuraCredit: Debt remaining");
+
+        uint256 refund = b.collateralETH;
+        b.collateralETH = 0;
+        b.isOpen = false;
+
+        if (refund > 0) {
+            (bool sent, ) = payable(msg.sender).call{value: refund}("");
+            require(sent, "AuraCredit: Collateral return failed");
+        }
+
+        emit FacilityClosed(msg.sender, refund);
+    }
+
+    // 5. depositJuniorTrancheCapital
+    function depositJuniorTrancheCapital() external payable whenNotPaused {
+        require(msg.value > 0, "AuraCredit: Zero deposit");
+
+        TrancheProvider storage jp = juniorProviders[msg.sender];
+        jp.suppliedETH += msg.value;
+        jp.isActive = true;
+        totalJuniorCapital += msg.value;
+
+        emit JuniorCapitalSupplied(msg.sender, msg.value);
+    }
+
+    // 6. depositSeniorTrancheCapital
+    function depositSeniorTrancheCapital() external payable whenNotPaused {
+        require(msg.value > 0, "AuraCredit: Zero deposit");
+
+        TrancheProvider storage sp = seniorProviders[msg.sender];
+        sp.suppliedETH += msg.value;
+        sp.isActive = true;
+        totalSeniorCapital += msg.value;
+
+        emit SeniorCapitalSupplied(msg.sender, msg.value);
+    }
+
+    // 7. drainEmergencyReserves
+    function drainEmergencyReserves() external onlyGovernor {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "AuraCredit: Zero balance");
+
+        totalSeniorCapital = 0;
+        totalJuniorCapital = 0;
+        accumulatedInterestPool = 0;
+
+        (bool sent, ) = creditGovernor.call{value: balance}("");
+        require(sent, "AuraCredit: Drain failed");
+
+        emit ReservesDrained(creditGovernor, balance);
+    }
+
+    // 8. harvestProtocolInterest
+    function harvestProtocolInterest() external onlyGovernor {
+        uint256 amount = accumulatedInterestPool;
+        if (amount == 0 && address(this).balance > (totalSeniorCapital + totalJuniorCapital)) {
+            amount = address(this).balance - (totalSeniorCapital + totalJuniorCapital);
+        }
+        require(amount > 0, "AuraCredit: Zero harvestable yield");
+
+        accumulatedInterestPool = 0;
+        (bool sent, ) = creditGovernor.call{value: amount}("");
+        require(sent, "AuraCredit: Interest harvest failed");
+
+        emit InterestHarvested(creditGovernor, amount);
+    }
+
+    // 9. liquidateOverdueFacility
+    function liquidateOverdueFacility(address borrower) external onlyGovernor {
+        BorrowerFacility storage b = facilities[borrower];
+        require(b.isOpen && b.borrowedPrincipal > 0, "AuraCredit: No active debt");
+
+        uint256 seized = b.collateralETH;
+        b.collateralETH = 0;
+        b.borrowedPrincipal = 0;
+        b.isOpen = false;
+
+        if (seized > 0) {
+            (bool sent, ) = creditGovernor.call{value: seized}("");
+            require(sent, "AuraCredit: Liquidation seize failed");
+        }
+
+        emit FacilityLiquidated(borrower, creditGovernor, seized);
+    }
+
+    // 10. lockFacilityCollateral
+    function lockFacilityCollateral(uint256 creditLimit) external payable whenNotPaused {
+        require(msg.value > 0, "AuraCredit: Zero collateral");
+        require(creditLimit > 0, "AuraCredit: Zero limit");
+
+        BorrowerFacility storage b = facilities[msg.sender];
+        b.collateralETH += msg.value;
+        b.maxCreditLimit = creditLimit;
+        b.isOpen = true;
+
+        emit CollateralLocked(msg.sender, msg.value, creditLimit);
+    }
+
+    // 11. rebalanceFacilityLimit
+    function rebalanceFacilityLimit(address borrower, uint256 newLimit) external onlyGovernor {
+        BorrowerFacility storage b = facilities[borrower];
+        require(b.isOpen, "AuraCredit: Facility not open");
+        require(newLimit >= b.borrowedPrincipal, "AuraCredit: Limit below debt");
+
+        b.maxCreditLimit = newLimit;
+        emit FacilityLimitRebalanced(borrower, newLimit);
+    }
+
+    // 12. repayCreditBorrow
+    function repayCreditBorrow() external payable {
+        BorrowerFacility storage b = facilities[msg.sender];
+        require(b.isOpen && b.borrowedPrincipal > 0, "AuraCredit: No debt");
+        require(msg.value > 0, "AuraCredit: Zero repayment");
+
+        uint256 actualRepay = msg.value > b.borrowedPrincipal ? b.borrowedPrincipal : msg.value;
+        b.borrowedPrincipal -= actualRepay;
+        totalBorrowedDebt -= actualRepay;
+
+        if (msg.value > actualRepay) {
+            uint256 refund = msg.value - actualRepay;
+            (bool sent, ) = payable(msg.sender).call{value: refund}("");
+            require(sent, "AuraCredit: Refund failed");
+        }
+
+        emit CreditRepaid(msg.sender, actualRepay);
+    }
+
+    // 13. toggleProtocolPause
+    function toggleProtocolPause(bool isPaused) external onlyGovernor {
+        isProtocolPaused = isPaused;
+        emit PauseStateToggled(isPaused);
+    }
+
+    // 14. transferLenderStake
+    function transferLenderStake(address to, uint256 amount) external {
+        TrancheProvider storage fromSp = seniorProviders[msg.sender];
+        require(fromSp.isActive && fromSp.suppliedETH >= amount && amount > 0, "AuraCredit: Insufficient balance");
+        require(to != address(0), "AuraCredit: Zero recipient");
+
+        fromSp.suppliedETH -= amount;
+        if (fromSp.suppliedETH == 0) {
+            fromSp.isActive = false;
+        }
+
+        TrancheProvider storage toSp = seniorProviders[to];
+        toSp.suppliedETH += amount;
+        toSp.isActive = true;
+
+        emit LenderStakeTransferred(msg.sender, to, amount);
+    }
+
+    // 15. updateProtocolDescriptor
+    function updateProtocolDescriptor(string calldata newDescriptor) external onlyGovernor {
+        require(bytes(newDescriptor).length > 0, "AuraCredit: Empty descriptor");
+        protocolDescriptor = newDescriptor;
+        emit DescriptorUpdated(newDescriptor);
+    }
+
+    // 16. withdrawSeniorTrancheCapital
+    function withdrawSeniorTrancheCapital(uint256 amount) external {
+        TrancheProvider storage sp = seniorProviders[msg.sender];
+        require(sp.isActive && sp.suppliedETH >= amount && amount > 0, "AuraCredit: Insufficient capital");
+
+        sp.suppliedETH -= amount;
+        totalSeniorCapital -= amount;
+        if (sp.suppliedETH == 0) {
+            sp.isActive = false;
+        }
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "AuraCredit: Withdrawal failed");
+
+        emit SeniorCapitalWithdrawn(msg.sender, amount);
+    }
+
+    // Чтение информации о кредитной линии
+    function getFacilityDetails(address borrower) external view returns (
+        uint256 collateral,
+        uint256 debt,
+        uint256 limit,
+        bool open
+    ) {
+        BorrowerFacility memory b = facilities[borrower];
+        return (b.collateralETH, b.borrowedPrincipal, b.maxCreditLimit, b.isOpen);
+    }
+}
